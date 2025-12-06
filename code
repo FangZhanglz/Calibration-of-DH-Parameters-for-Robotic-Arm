@@ -228,403 +228,656 @@ static SolverResult solve_ad_length(const Problem& P, const VectorXd& x0, const 
     return { x0, opt.max_iters, eval_cost(x0), false };
 }
 
+
+
+//---------------------机械臂二次标定所需程序--------------------------
+// q: 该姿态下的关节角（弧度）
+// p: 激光跟踪仪测得的末端坐标（已转换到机械臂基坐标系）
+struct PoseMeasure {
+    VectorXd q;   // 长度 N
+    Vector3d p;   // 3x1
+};
+
+struct Problem2 {
+    int N;                    // 轴数
+    VectorXd alpha;           // 固定 DH alpha_i，长度 N
+    vector<PoseMeasure> ms;   // 多个姿态测量
+};
+
+// 由 x = [a_1..a_N, d_1..d_N] 与方向基 U，计算当前姿态下末端位置 p
+static inline void eval_p(
+    const UDirs& U, const VectorXd& x, int N,
+    Vector3d& p)
+{
+    p.setZero();
+    for (int i = 0; i < N; ++i) {
+        double ai = x[i];
+        double di = x[N + i];
+        p += ai * U.ux[i] + di * U.uz[i];
+    }
+}
+
+// 计算单个姿态测量的残差 r (3x1) 与雅可比 J (3x2N)
+// r = p_model(q, x) - p_meas
+static inline void residual_and_grad2(
+    const Problem2& P, const PoseMeasure& m, const VectorXd& x,
+    Vector3d& r, MatrixXd& J)        // J: 3 x (2N)
+{
+    const int N = P.N;
+    // 1) 该姿态下的关节方向基
+    UDirs U = compute_u_dirs(P.alpha, m.q);
+
+    // 2) 模型末端位置
+    Vector3d p_model;
+    eval_p(U, x, N, p_model);
+
+    // 3) 位置残差：模型 - 测量
+    r = p_model - m.p;
+
+    // 4) 雅可比：∂p/∂a_i = u_ix(i), ∂p/∂d_i = u_iz(i)
+    J.resize(3, 2 * N);
+    for (int i = 0; i < N; ++i) {
+        J.col(i) = U.ux[i];  // 对 a_i
+        J.col(N + i) = U.uz[i];  // 对 d_i
+    }
+}
+
+// 计算所有残差的模长，便于打印
+static VectorXd compute_residuals2(const Problem2& P, const VectorXd& x) {
+    VectorXd r(P.ms.size());
+    for (size_t k = 0; k < P.ms.size(); ++k) {
+        Vector3d rk;
+        MatrixXd J;
+        residual_and_grad2(P, P.ms[k], x, rk, J);
+        r[(int)k] = rk.norm();   // 每个姿态的位置误差 ||p_model - p_meas||
+    }
+    return r;
+}
+
+static SolverResult solve_ad_point(const Problem2& P, const VectorXd& x0, const SolverOptions& opt) {
+    const int N = P.N;
+    const int D = 2 * N;
+    VectorXd x = x0;
+    double lambda = opt.lambda0;
+
+    auto eval_cost = [&](const VectorXd& x)->double {
+        double c = 0;
+        for (const auto& m : P.ms) {
+            Vector3d r;
+            MatrixXd J;
+            residual_and_grad2(P, m, x, r, J);
+            c += r.squaredNorm();   // r 是 3x1
+        }
+        return 0.5 * c;
+    };
+
+    for (int it = 0; it < opt.max_iters; ++it) {
+        MatrixXd H = MatrixXd::Zero(D, D);
+        VectorXd b = VectorXd::Zero(D);
+        double cost = 0;
+        double max_abs_r = 0.0;          // 本轮最大位置残差范数
+
+        MatrixXd J(3, D);
+        Vector3d r3;
+
+        // 累加 H = Σ J^T J,  b = Σ J^T r
+        for (const auto& m : P.ms) {
+            residual_and_grad2(P, m, x, r3, J);
+            H.noalias() += J.transpose() * J;
+            b.noalias() += J.transpose() * r3;
+            cost += r3.squaredNorm();
+            double rn = r3.norm();
+            if (rn > max_abs_r) max_abs_r = rn;
+        }
+        cost *= 0.5;
+
+        // 梯度 = b
+        VectorXd grad = b;
+        VectorXd g_inf = grad.cwiseAbs();
+
+        // LM 正则
+        MatrixXd Hreg = H;
+        if (opt.use_LM) Hreg.diagonal().array() += lambda;
+        VectorXd dx = -Hreg.ldlt().solve(b);
+
+        if (opt.verbose) {
+            std::cout << "[iter " << (it + 1) << "] "
+                << "cost=" << cost
+                << "  max|r|=" << max_abs_r
+                << "  |dx|=" << dx.norm()
+                << "  lambda=" << (opt.use_LM ? lambda : 0.0)
+                << "\n";
+        }
+
+        // 停止条件：梯度无穷范数
+        if (g_inf.maxCoeff() < opt.tol_grad) {
+            if (opt.verbose) {
+                auto rv = compute_residuals2(P, x);
+                std::cout << "Converged by grad. Final residual norms:\n";
+                for (int k = 0; k < rv.size(); ++k)
+                    std::cout << "  |r[" << k << "]|=" << rv[k] << "\n";
+            }
+            return { x, it, cost, true };
+        }
+
+        // 停止条件：步长太小
+        if (dx.norm() < opt.tol_dx) {
+            if (opt.verbose) {
+                auto rv = compute_residuals2(P, x);
+                std::cout << "Converged by step. Final residual norms:\n";
+                for (int k = 0; k < rv.size(); ++k)
+                    std::cout << "  |r[" << k << "]|=" << rv[k] << "\n";
+            }
+            return { x, it, cost, true };
+        }
+
+        // LM 步骤接受 / 拒绝
+        if (opt.use_LM) {
+            double new_cost = eval_cost(x + dx);
+            if (new_cost < cost) {
+                x += dx;
+                lambda = std::max(lambda * 0.3, 1e-12);
+            }
+            else {
+                lambda = std::min(lambda * 3.0, 1e12);
+            }
+        }
+        else {
+            x += dx;
+        }
+
+        if (it == opt.max_iters - 1) {
+            if (opt.verbose) {
+                auto rv = compute_residuals2(P, x);
+                std::cout << "Max iters reached. Final residual norms:\n";
+                for (int k = 0; k < rv.size(); ++k)
+                    std::cout << "  |r[" << k << "]|=" << rv[k] << "\n";
+            }
+            return { x, it + 1, eval_cost(x), false };
+        }
+    }
+    return { x0, opt.max_iters, eval_cost(x0), false };
+}
+
+
+
 // ------------------- 示例主函数（请按需替换数据） -------------------
 int main() {
-    const int N = 7; // 轴数可变
-    Problem P; P.N = N;
-    P.alpha = VectorXd(N);
-    // TODO: 填入真实 alpha_i（弧度）
-    // 例如：P.alpha << 0, -M_PI/2, 0, -M_PI/2,  M_PI/2, -M_PI/2, 0;
-    P.alpha << 1.5708, 1.5708, 1.5708, 1.5708, 1.5708, 1.5708, 1.5708;
-    // 输入测量：每条包含两次触碰 q1,q2（弧度）和标定杆长度 L
-    // 注意：至少 14 对，更建议 40+ 对
-    const double L = 0.250; // 例：200 mm 的杆 => 0.200 m
-    // 初值：可用设计标称 a_i,d_i；未知则置零或小随机
 
-    VectorXd x0 = VectorXd(2 * N); // [a... d...] 单位与模型一致（米）初值
-    x0 << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //a
-        -0.3257, 0.0, 0.117, 0.0, 0.217, -0.005, -0.1777;//d
+    int k;
+    cout << "1.标定杆标定    2.第二个机械臂标定"<<endl;
+    cin >> k;
+    if (k == 1) {
+        int N = 7; // 轴数可变
+        Problem P;
+        P.N = N;
+        P.alpha = VectorXd(N);
+        // TODO: 填入真实 alpha_i（弧度）
+        // 例如：P.alpha << 0, -M_PI/2, 0, -M_PI/2,  M_PI/2, -M_PI/2, 0;
+        P.alpha << 1.5708, 1.5708, 1.5708, 1.5708, 1.5708, 1.5708, 1.5708;
+        // 输入测量：每条包含两次触碰 q1,q2（弧度）和标定杆长度 L
+        // 注意：至少 14 对，更建议 40+ 对
+        const double L = 0.250; // 例：200 mm 的杆 => 0.200 m
+        // 初值：可用设计标称 a_i,d_i；未知则置零或小随机
+
+        VectorXd x0 = VectorXd(2 * N); // [a... d...] 单位与模型一致（米）初值
+        x0 << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //a
+            -0.3257, 0.0, 0.417, 0.0, 0.417, -0.005, -0.1777;//d
 
 
-    //初始关节角
-    
-    {
-    VectorXd q_zero;
-    q_zero.resize(7);
-    q_zero << -1.5708, 1.5708, 1.5708, -1.5708, -3.1416, -1.5708, 0.0;
+        //初始关节角
 
-   
-    PairMeasure m1;
-    m1.q1 = VectorXd(N);
-    m1.q2 = VectorXd(N);
-    m1.q1 << 2.0413, -0.9737, 2.6135, -0.1773, -2.0266, 0.6625, -0.0355;
-    m1.q2 << 1.6745, -0.4235, 2.335, -0.9439, -2.2709, 0.3951, -0.1289;
-    m1.q1 += q_zero;
-    m1.q2 += q_zero;
-    m1.L = L;
-    P.ms.push_back(m1);
+        {
+            VectorXd q_zero;
+            q_zero.resize(7);
+            q_zero << -1.5708, 1.5708, 1.5708, -1.5708, -3.1416, -1.5708, 0.0;
 
-    PairMeasure m2;
-    m2.q1 = VectorXd(N);
-    m2.q2 = VectorXd(N);
-    m2.q1 << 1.6745, -0.4235, 2.335, -0.9439, -2.2709, 0.3951, -0.1289;
-    m2.q2 << 1.9796, -0.4737, 2.5275, -0.0472, -2.0851, 0.733, 0.5147;
-    m2.q1 += q_zero;
-    m2.q2 += q_zero;
-    m2.L = L;
-    P.ms.push_back(m2);
 
-    PairMeasure m3;
-    m3.q1 = VectorXd(N);
-    m3.q2 = VectorXd(N);
-    m3.q1 << 2.0413, -0.9737, 2.6135, -0.1773, -2.0266, 0.6625, -0.0355;
-    m3.q2 << 1.8449, -0.4876, 2.4355, -0.4502, -2.2026, 0.5445, 0.1854;
-    m3.q1 += q_zero;
-    m3.q2 += q_zero;
-    m3.L = L;
-    P.ms.push_back(m3);
+            PairMeasure m1;
+            m1.q1 = VectorXd(N);
+            m1.q2 = VectorXd(N);
+            m1.q1 << 2.0413, -0.9737, 2.6135, -0.1773, -2.0266, 0.6625, -0.0355;
+            m1.q2 << 1.6745, -0.4235, 2.335, -0.9439, -2.2709, 0.3951, -0.1289;
+            m1.q1 += q_zero;
+            m1.q2 += q_zero;
+            m1.L = L;
+            P.ms.push_back(m1);
 
-    PairMeasure m4;
-    m4.q1 = VectorXd(N);
-    m4.q2 = VectorXd(N);
-    m4.q1 << 1.8449, -0.4876, 2.4355, -0.4502, -2.2026, 0.5445, 0.1854;
-    m4.q2 << 1.7919, -0.7595, 2.435, -0.6815, -2.2226, 0.4352, -0.2496;
-    m4.q1 += q_zero;
-    m4.q2 += q_zero;
-    m4.L = L;
-    P.ms.push_back(m4);
+            PairMeasure m2;
+            m2.q1 = VectorXd(N);
+            m2.q2 = VectorXd(N);
+            m2.q1 << 1.6745, -0.4235, 2.335, -0.9439, -2.2709, 0.3951, -0.1289;
+            m2.q2 << 1.9796, -0.4737, 2.5275, -0.0472, -2.0851, 0.733, 0.5147;
+            m2.q1 += q_zero;
+            m2.q2 += q_zero;
+            m2.L = L;
+            P.ms.push_back(m2);
 
-    PairMeasure m5;
-    m5.q1 = VectorXd(N);
-    m5.q2 = VectorXd(N);
-    m5.q1 << 1.7919, -0.7595, 2.435, -0.6815, -2.2226, 0.4352, -0.2496;
-    m5.q2 << 2.0062, -0.6534, 2.566, -0.0249, -2.0437, 0.6913, 0.3914;
-    m5.q1 += q_zero;
-    m5.q2 += q_zero;
-    m5.L = L;
-    P.ms.push_back(m5);
+            PairMeasure m3;
+            m3.q1 = VectorXd(N);
+            m3.q2 = VectorXd(N);
+            m3.q1 << 2.0413, -0.9737, 2.6135, -0.1773, -2.0266, 0.6625, -0.0355;
+            m3.q2 << 1.8449, -0.4876, 2.4355, -0.4502, -2.2026, 0.5445, 0.1854;
+            m3.q1 += q_zero;
+            m3.q2 += q_zero;
+            m3.L = L;
+            P.ms.push_back(m3);
 
-    PairMeasure m6;
-    m6.q1 = VectorXd(N);
-    m6.q2 = VectorXd(N);
-    m6.q1 << 2.0062, -0.6534, 2.566, -0.0249, -2.0437, 0.6913, 0.3914;
-    m6.q2 << 1.6017, -0.454, 2.3211, -1.1585, -2.2986, 0.2617, -0.3042;
-    m6.q1 += q_zero;
-    m6.q2 += q_zero;
-    m6.L = L;
-    P.ms.push_back(m6);
+            PairMeasure m4;
+            m4.q1 = VectorXd(N);
+            m4.q2 = VectorXd(N);
+            m4.q1 << 1.8449, -0.4876, 2.4355, -0.4502, -2.2026, 0.5445, 0.1854;
+            m4.q2 << 1.7919, -0.7595, 2.435, -0.6815, -2.2226, 0.4352, -0.2496;
+            m4.q1 += q_zero;
+            m4.q2 += q_zero;
+            m4.L = L;
+            P.ms.push_back(m4);
 
-    PairMeasure m7;
-    m7.q1 = VectorXd(N);
-    m7.q2 = VectorXd(N);
-    m7.q1 << 1.8682, -0.7386, 2.4627, -0.4446, -2.141, 0.5058, -0.0165;
-    m7.q2 << 1.6557, -0.2359, 2.3147, -0.9842, -2.2601, 0.3213, 0.0532;
-    m7.q1 += q_zero;
-    m7.q2 += q_zero;
-    m7.L = L;
-    P.ms.push_back(m7);
+            PairMeasure m5;
+            m5.q1 = VectorXd(N);
+            m5.q2 = VectorXd(N);
+            m5.q1 << 1.7919, -0.7595, 2.435, -0.6815, -2.2226, 0.4352, -0.2496;
+            m5.q2 << 2.0062, -0.6534, 2.566, -0.0249, -2.0437, 0.6913, 0.3914;
+            m5.q1 += q_zero;
+            m5.q2 += q_zero;
+            m5.L = L;
+            P.ms.push_back(m5);
 
-    PairMeasure m8;
-    m8.q1 = VectorXd(N);
-    m8.q2 = VectorXd(N);
-    m8.q1 << 2.0534, -0.7552, 2.6158, 0.0562, -1.9788, 0.6945, 0.3834;
-    m8.q2 << 1.6204, -0.3194, 2.3288, -1.1086, -2.2908, 0.2755, -0.1301;
-    m8.q1 += q_zero;
-    m8.q2 += q_zero;
-    m8.L = L;
-    P.ms.push_back(m8);
+            PairMeasure m6;
+            m6.q1 = VectorXd(N);
+            m6.q2 = VectorXd(N);
+            m6.q1 << 2.0062, -0.6534, 2.566, -0.0249, -2.0437, 0.6913, 0.3914;
+            m6.q2 << 1.6017, -0.454, 2.3211, -1.1585, -2.2986, 0.2617, -0.3042;
+            m6.q1 += q_zero;
+            m6.q2 += q_zero;
+            m6.L = L;
+            P.ms.push_back(m6);
 
-    PairMeasure m9;
-    m9.q1 = VectorXd(N);
-    m9.q2 = VectorXd(N);
-    m9.q1 << 1.9854, -0.6407, 2.5517, -0.0417, -2.0329, 0.6722, 0.4055;
-    m9.q2 << 1.6776, -0.1271, 2.3352, -0.8873, -2.2572, 0.3581, 0.238;
-    m9.q1 += q_zero;
-    m9.q2 += q_zero;
-    m9.L = L;
-    P.ms.push_back(m9);
+            PairMeasure m7;
+            m7.q1 = VectorXd(N);
+            m7.q2 = VectorXd(N);
+            m7.q1 << 1.8682, -0.7386, 2.4627, -0.4446, -2.141, 0.5058, -0.0165;
+            m7.q2 << 1.6557, -0.2359, 2.3147, -0.9842, -2.2601, 0.3213, 0.0532;
+            m7.q1 += q_zero;
+            m7.q2 += q_zero;
+            m7.L = L;
+            P.ms.push_back(m7);
 
-    PairMeasure m10;
-    m10.q1 = VectorXd(N);
-    m10.q2 = VectorXd(N);
-    m10.q1 << 1.8392, -0.4541, 2.4314, -0.4211, -2.1662, 0.5249, 0.2763;
-    m10.q2 << 1.8865, -0.8222, 2.5063, -0.4351, -2.12, 0.5033, -0.08;
-    m10.q1 += q_zero;
-    m10.q2 += q_zero;
-    m10.L = L;
-    P.ms.push_back(m10);
+            PairMeasure m8;
+            m8.q1 = VectorXd(N);
+            m8.q2 = VectorXd(N);
+            m8.q1 << 2.0534, -0.7552, 2.6158, 0.0562, -1.9788, 0.6945, 0.3834;
+            m8.q2 << 1.6204, -0.3194, 2.3288, -1.1086, -2.2908, 0.2755, -0.1301;
+            m8.q1 += q_zero;
+            m8.q2 += q_zero;
+            m8.L = L;
+            P.ms.push_back(m8);
 
-    PairMeasure m11;
-    m11.q1 = VectorXd(N);
-    m11.q2 = VectorXd(N);
-    m11.q1 << 1.6043, -0.3121, 2.3273, -1.1266, -2.2922, 0.2787, -0.1264;
-    m11.q2 << 1.9949, -0.5813, 2.5499, 0.0258, -2.0148, 0.7095, 0.5195;
-    m11.q1 += q_zero;
-    m11.q2 += q_zero;
-    m11.L = L;
-    P.ms.push_back(m11);
+            PairMeasure m9;
+            m9.q1 = VectorXd(N);
+            m9.q2 = VectorXd(N);
+            m9.q1 << 1.9854, -0.6407, 2.5517, -0.0417, -2.0329, 0.6722, 0.4055;
+            m9.q2 << 1.6776, -0.1271, 2.3352, -0.8873, -2.2572, 0.3581, 0.238;
+            m9.q1 += q_zero;
+            m9.q2 += q_zero;
+            m9.L = L;
+            P.ms.push_back(m9);
 
-    PairMeasure m12;
-    m12.q1 = VectorXd(N);
-    m12.q2 = VectorXd(N);
-    m12.q1 << 1.8392, -0.4541, 2.4314, -0.4211, -2.1662, 0.5249, 0.2763;
-    m12.q2 << 1.5546, 0.1136, 2.2666, -1.2443, -2.234, 0.222, 0.2271;
-    m12.q1 += q_zero;
-    m12.q2 += q_zero;
-    m12.L = L;
-    P.ms.push_back(m12);
+            PairMeasure m10;
+            m10.q1 = VectorXd(N);
+            m10.q2 = VectorXd(N);
+            m10.q1 << 1.8392, -0.4541, 2.4314, -0.4211, -2.1662, 0.5249, 0.2763;
+            m10.q2 << 1.8865, -0.8222, 2.5063, -0.4351, -2.12, 0.5033, -0.08;
+            m10.q1 += q_zero;
+            m10.q2 += q_zero;
+            m10.L = L;
+            P.ms.push_back(m10);
 
-    PairMeasure m13;
-    m13.q1 = VectorXd(N);
-    m13.q2 = VectorXd(N);
-    m13.q1 << 1.6264, -0.2103, 2.2991, -1.0365, -2.2373, 0.2913, 0.0584;
-    m13.q2 << 1.9714, -0.7552, 2.5453, -0.1259, -2.023, 0.6082, 0.2561;
-    m13.q1 += q_zero;
-    m13.q2 += q_zero;
-    m13.L = L;
-    P.ms.push_back(m13);
+            PairMeasure m11;
+            m11.q1 = VectorXd(N);
+            m11.q2 = VectorXd(N);
+            m11.q1 << 1.6043, -0.3121, 2.3273, -1.1266, -2.2922, 0.2787, -0.1264;
+            m11.q2 << 1.9949, -0.5813, 2.5499, 0.0258, -2.0148, 0.7095, 0.5195;
+            m11.q1 += q_zero;
+            m11.q2 += q_zero;
+            m11.L = L;
+            P.ms.push_back(m11);
 
-    PairMeasure m14;
-    m14.q1 = VectorXd(N);
-    m14.q2 = VectorXd(N);
-    m14.q1 << 1.8865, -0.8222, 2.5063, -0.4351, -2.12, 0.5033, -0.08;
-    m14.q2 << 1.8742, -0.5029, 2.4346, -0.2842, -2.102, 0.5625, 0.3639;
-    m14.q1 += q_zero;
-    m14.q2 += q_zero;
-    m14.L = L;
-    P.ms.push_back(m14);
+            PairMeasure m12;
+            m12.q1 = VectorXd(N);
+            m12.q2 = VectorXd(N);
+            m12.q1 << 1.8392, -0.4541, 2.4314, -0.4211, -2.1662, 0.5249, 0.2763;
+            m12.q2 << 1.5546, 0.1136, 2.2666, -1.2443, -2.234, 0.222, 0.2271;
+            m12.q1 += q_zero;
+            m12.q2 += q_zero;
+            m12.L = L;
+            P.ms.push_back(m12);
 
-    PairMeasure m15;
-    m15.q1 = VectorXd(N);
-    m15.q2 = VectorXd(N);
-    m15.q1 << 1.9714, - 0.7552,	2.5453 ,- 0.1259 ,- 2.023,	0.6082,	0.2561   ;
-    m15.q2 << 1.7358, - 0.2674,	2.3252 ,- 0.6681, - 2.1809,	0.4195,	0.297   ;
-    m15.q1 += q_zero;
-    m15.q2 += q_zero;
-    m15.L = L;
-    P.ms.push_back(m15);
+            PairMeasure m13;
+            m13.q1 = VectorXd(N);
+            m13.q2 = VectorXd(N);
+            m13.q1 << 1.6264, -0.2103, 2.2991, -1.0365, -2.2373, 0.2913, 0.0584;
+            m13.q2 << 1.9714, -0.7552, 2.5453, -0.1259, -2.023, 0.6082, 0.2561;
+            m13.q1 += q_zero;
+            m13.q2 += q_zero;
+            m13.L = L;
+            P.ms.push_back(m13);
 
-    PairMeasure m16;
-    m16.q1 = VectorXd(N);
-    m16.q2 = VectorXd(N);
-    m16.q1 << 1.9714, -0.7552, 2.5453, -0.1259, -2.023, 0.6082, 0.2561;
-    m16.q2 << 1.8456, - 0.3147,	2.3808, - 0.3074, - 2.1159,	0.56,	0.536  ;
-    m16.q1 += q_zero;
-    m16.q2 += q_zero;
-    m16.L = L;
-    P.ms.push_back(m16);
+            PairMeasure m14;
+            m14.q1 = VectorXd(N);
+            m14.q2 = VectorXd(N);
+            m14.q1 << 1.8865, -0.8222, 2.5063, -0.4351, -2.12, 0.5033, -0.08;
+            m14.q2 << 1.8742, -0.5029, 2.4346, -0.2842, -2.102, 0.5625, 0.3639;
+            m14.q1 += q_zero;
+            m14.q2 += q_zero;
+            m14.L = L;
+            P.ms.push_back(m14);
 
-    //数据2
-    PairMeasure m17;
-    m17.q1 = VectorXd(N);
-    m17.q2 = VectorXd(N);
-    m17.q1 << 1.8391,  0.0921,   2.4194, - 0.1296, - 2.0945, 0.7746, 1.1793;
-    m17.q2 << 1.7486, - 0.241, 2.4275, - 0.3773, - 2.1301, 0.6466, 0.6713;
-    m17.q1 += q_zero;
-    m17.q2 += q_zero;
-    m17.L = L;
-    P.ms.push_back(m17);
+            PairMeasure m15;
+            m15.q1 = VectorXd(N);
+            m15.q2 = VectorXd(N);
+            m15.q1 << 1.9714, -0.7552, 2.5453, -0.1259, -2.023, 0.6082, 0.2561;
+            m15.q2 << 1.7358, -0.2674, 2.3252, -0.6681, -2.1809, 0.4195, 0.297;
+            m15.q1 += q_zero;
+            m15.q2 += q_zero;
+            m15.L = L;
+            P.ms.push_back(m15);
 
-    PairMeasure m18;
-    m18.q1 = VectorXd(N);
-    m18.q2 = VectorXd(N);
-    m18.q1 << 1.8122, - 0.2837, 2.4728, - 0.1975, - 2.0824, 0.7245, 0.7686;
-    m18.q2 << 1.8955, 0.1071, 2.4498, 0.016, - 2.0566, 0.8579, 1.2954;
-    m18.q1 += q_zero;
-    m18.q2 += q_zero;
-    m18.L = L;
-    P.ms.push_back(m18);
+            PairMeasure m16;
+            m16.q1 = VectorXd(N);
+            m16.q2 = VectorXd(N);
+            m16.q1 << 1.9714, -0.7552, 2.5453, -0.1259, -2.023, 0.6082, 0.2561;
+            m16.q2 << 1.8456, -0.3147, 2.3808, -0.3074, -2.1159, 0.56, 0.536;
+            m16.q1 += q_zero;
+            m16.q2 += q_zero;
+            m16.L = L;
+            P.ms.push_back(m16);
 
-    PairMeasure m19;
-    m19.q1 = VectorXd(N);
-    m19.q2 = VectorXd(N);
-    m19.q1 << 0.8924,- 0.2915,0.9075,- 0.25,- 0.8276,- 0.1792,0.7459;
-    m19.q2 << 1.0817,- 0.3867,0.8462,- 0.7783,- 0.8922,- 0.0169,0.2705;
-    m19.q1 += q_zero;
-    m19.q2 += q_zero;
-    m19.L = L;
-    P.ms.push_back(m19);
+            //数据2
+            PairMeasure m17;
+            m17.q1 = VectorXd(N);
+            m17.q2 = VectorXd(N);
+            m17.q1 << 1.8391, 0.0921, 2.4194, -0.1296, -2.0945, 0.7746, 1.1793;
+            m17.q2 << 1.7486, -0.241, 2.4275, -0.3773, -2.1301, 0.6466, 0.6713;
+            m17.q1 += q_zero;
+            m17.q2 += q_zero;
+            m17.L = L;
+            P.ms.push_back(m17);
 
-    PairMeasure m20;
-    m20.q1 = VectorXd(N);
-    m20.q2 = VectorXd(N);
-    m20.q1 << 1.0075, - 0.3869, 0.8698, 0.1779, - 0.7784, - 0.338,1.002;
-    m20.q2 << 1.1192, - 0.5907, 0.7153, - 0.1942, - 0.8761, - 0.2037, 0.5281;
-    m20.q1 += q_zero;
-    m20.q2 += q_zero;
-    m20.L = L;
-    P.ms.push_back(m20);
+            PairMeasure m18;
+            m18.q1 = VectorXd(N);
+            m18.q2 = VectorXd(N);
+            m18.q1 << 1.8122, -0.2837, 2.4728, -0.1975, -2.0824, 0.7245, 0.7686;
+            m18.q2 << 1.8955, 0.1071, 2.4498, 0.016, -2.0566, 0.8579, 1.2954;
+            m18.q1 += q_zero;
+            m18.q2 += q_zero;
+            m18.L = L;
+            P.ms.push_back(m18);
 
-    PairMeasure m21;
-    m21.q1 = VectorXd(N);
-    m21.q2 = VectorXd(N);
-    m21.q1 << 1.0075, -0.3869, 0.8698, 0.1779, -0.7784, -0.338, 1.002;
-    m21.q2 << 1.3563, 0.1574, 0.9374,- 0.724, - 0.7261,- 0.1497, 0.8824;
-    m21.q1 += q_zero;
-    m21.q2 += q_zero;
-    m21.L = L;
-    P.ms.push_back(m21);
+            PairMeasure m19;
+            m19.q1 = VectorXd(N);
+            m19.q2 = VectorXd(N);
+            m19.q1 << 0.8924, -0.2915, 0.9075, -0.25, -0.8276, -0.1792, 0.7459;
+            m19.q2 << 1.0817, -0.3867, 0.8462, -0.7783, -0.8922, -0.0169, 0.2705;
+            m19.q1 += q_zero;
+            m19.q2 += q_zero;
+            m19.L = L;
+            P.ms.push_back(m19);
 
-    PairMeasure m22;
-    m22.q1 = VectorXd(N);
-    m22.q2 = VectorXd(N);
-    m22.q1 << 1.0886, - 0.1248, 0.9415, - 0.0418, - 0.7362, - 0.3722, 1.1283;
-    m22.q2 << 1.3631, - 0.1425, 0.8578, - 0.6716, - 0.7741, - 0.1443, 0.6388;
-    m22.q1 += q_zero;
-    m22.q2 += q_zero;
-    m22.L = L;
-    P.ms.push_back(m22);
+            PairMeasure m20;
+            m20.q1 = VectorXd(N);
+            m20.q2 = VectorXd(N);
+            m20.q1 << 1.0075, -0.3869, 0.8698, 0.1779, -0.7784, -0.338, 1.002;
+            m20.q2 << 1.1192, -0.5907, 0.7153, -0.1942, -0.8761, -0.2037, 0.5281;
+            m20.q1 += q_zero;
+            m20.q2 += q_zero;
+            m20.L = L;
+            P.ms.push_back(m20);
 
-    PairMeasure m23;
-    m23.q1 = VectorXd(N);
-    m23.q2 = VectorXd(N);
-    m23.q1 << 1.0547, - 0.0035, 1.0615,0.0183, - 0.6371, - 0.3859, 1.3093;
-    m23.q2 << 1.1403, - 0.326, 0.8735, - 0.0985,- 0.768, - 0.2763, 0.1961;
-    m23.q1 += q_zero;
-    m23.q2 += q_zero;
-    m23.L = L;
-    P.ms.push_back(m23);
+            PairMeasure m21;
+            m21.q1 = VectorXd(N);
+            m21.q2 = VectorXd(N);
+            m21.q1 << 1.0075, -0.3869, 0.8698, 0.1779, -0.7784, -0.338, 1.002;
+            m21.q2 << 1.3563, 0.1574, 0.9374, -0.724, -0.7261, -0.1497, 0.8824;
+            m21.q1 += q_zero;
+            m21.q2 += q_zero;
+            m21.L = L;
+            P.ms.push_back(m21);
 
-    PairMeasure m24;
-    m24.q1 = VectorXd(N);
-    m24.q2 = VectorXd(N);
-    m24.q1 << 1.1403, -0.326, 0.8735, -0.0985, -0.768, -0.2763, 0.1961;
-    m24.q2 << 1.5233,0.2771,0.9563, - 1.1513, - 0.6981, 0.0756, 0.7575;
-    m24.q1 += q_zero;
-    m24.q2 += q_zero;
-    m24.L = L;
-    P.ms.push_back(m24);
+            PairMeasure m22;
+            m22.q1 = VectorXd(N);
+            m22.q2 = VectorXd(N);
+            m22.q1 << 1.0886, -0.1248, 0.9415, -0.0418, -0.7362, -0.3722, 1.1283;
+            m22.q2 << 1.3631, -0.1425, 0.8578, -0.6716, -0.7741, -0.1443, 0.6388;
+            m22.q1 += q_zero;
+            m22.q2 += q_zero;
+            m22.L = L;
+            P.ms.push_back(m22);
 
-    PairMeasure m25;
-    m25.q1 = VectorXd(N);
-    m25.q2 = VectorXd(N);
-    m25.q1 << 1.0547, -0.0035, 1.0615, 0.0183, -0.6371, -0.3859, 1.3093;
-    m25.q2 << 1.3089, - 0.0654, 0.9303, - 0.5131,- 0.7205, - 0.1787, 0.8901;
-    m25.q1 += q_zero;
-    m25.q2 += q_zero;
-    m25.L = L;
-    P.ms.push_back(m25);
+            PairMeasure m23;
+            m23.q1 = VectorXd(N);
+            m23.q2 = VectorXd(N);
+            m23.q1 << 1.0547, -0.0035, 1.0615, 0.0183, -0.6371, -0.3859, 1.3093;
+            m23.q2 << 1.1403, -0.326, 0.8735, -0.0985, -0.768, -0.2763, 0.1961;
+            m23.q1 += q_zero;
+            m23.q2 += q_zero;
+            m23.L = L;
+            P.ms.push_back(m23);
 
-    PairMeasure m26;
-    m26.q1 = VectorXd(N);
-    m26.q2 = VectorXd(N);
-    m26.q1 << 1.3089, -0.0654, 0.9303, -0.5131, -0.7205, -0.1787, 0.8901;
-    m26.q2 << 0.9742, - 0.1983, 0.9959, 0.2306, - 0.6847, - 0.4487, 1.3171;
-    m26.q1 += q_zero;
-    m26.q2 += q_zero;
-    m26.L = L;
-    P.ms.push_back(m26);
+            PairMeasure m24;
+            m24.q1 = VectorXd(N);
+            m24.q2 = VectorXd(N);
+            m24.q1 << 1.1403, -0.326, 0.8735, -0.0985, -0.768, -0.2763, 0.1961;
+            m24.q2 << 1.5233, 0.2771, 0.9563, -1.1513, -0.6981, 0.0756, 0.7575;
+            m24.q1 += q_zero;
+            m24.q2 += q_zero;
+            m24.L = L;
+            P.ms.push_back(m24);
 
-    PairMeasure m27;
-    m27.q1 = VectorXd(N);
-    m27.q2 = VectorXd(N);
-    m27.q1 << 0.9742, -0.1983, 0.9959, 0.2306, -0.6847, -0.4487, 1.3171;
-    m27.q2 << 1.3689,  0.1763, 0.9633, - 0.7468,- 0.7068, - 0.1617, 0.9807;
-    m27.q1 += q_zero;
-    m27.q2 += q_zero;
-    m27.L = L;
-    P.ms.push_back(m27);
+            PairMeasure m25;
+            m25.q1 = VectorXd(N);
+            m25.q2 = VectorXd(N);
+            m25.q1 << 1.0547, -0.0035, 1.0615, 0.0183, -0.6371, -0.3859, 1.3093;
+            m25.q2 << 1.3089, -0.0654, 0.9303, -0.5131, -0.7205, -0.1787, 0.8901;
+            m25.q1 += q_zero;
+            m25.q2 += q_zero;
+            m25.L = L;
+            P.ms.push_back(m25);
 
-    PairMeasure m28;
-    m28.q1 = VectorXd(N);
-    m28.q2 = VectorXd(N);
-    m28.q1 << 1.3689, 0.1763, 0.9633, -0.7468, -0.7068, -0.1617, 0.9807;
-    m28.q2 << 1.0175, - 0.3322, 0.8553,0.1168, - 0.7612, - 0.4188, 1.1046;
-    m28.q1 += q_zero;
-    m28.q2 += q_zero;
-    m28.L = L;
-    P.ms.push_back(m28);
-    
+            PairMeasure m26;
+            m26.q1 = VectorXd(N);
+            m26.q2 = VectorXd(N);
+            m26.q1 << 1.3089, -0.0654, 0.9303, -0.5131, -0.7205, -0.1787, 0.8901;
+            m26.q2 << 0.9742, -0.1983, 0.9959, 0.2306, -0.6847, -0.4487, 1.3171;
+            m26.q1 += q_zero;
+            m26.q2 += q_zero;
+            m26.L = L;
+            P.ms.push_back(m26);
 
-    //数据3
-    PairMeasure m29;
-    m29.q1 = VectorXd(N);
-    m29.q2 = VectorXd(N);
-    m29.q1 << 1.3009,   0.0904,  0.9975,  - 0.2743,  - 0.645,  -0.3883,  1.2294;
-    m29.q2 << 1.4096,  - 0.1788,  0.8755,  - 0.4379, - 0.7013, - 0.2669, 0.8589;
-    m29.q1 += q_zero;
-    m29.q2 += q_zero;
-    m29.L = L;
-    P.ms.push_back(m29);
+            PairMeasure m27;
+            m27.q1 = VectorXd(N);
+            m27.q2 = VectorXd(N);
+            m27.q1 << 0.9742, -0.1983, 0.9959, 0.2306, -0.6847, -0.4487, 1.3171;
+            m27.q2 << 1.3689, 0.1763, 0.9633, -0.7468, -0.7068, -0.1617, 0.9807;
+            m27.q1 += q_zero;
+            m27.q2 += q_zero;
+            m27.L = L;
+            P.ms.push_back(m27);
 
-    PairMeasure m30;
-    m30.q1 = VectorXd(N);
-    m30.q2 = VectorXd(N);
-    m30.q1 << 1.4096, -0.1788, 0.8755, -0.4379, -0.7013, -0.2669, 0.8589;
-    m30.q2 << 1.4905,   0.1012,  1.0764,  - 0.7368,  - 0.3712, 0.4034, 1.0246;
-    m30.q1 += q_zero;
-    m30.q2 += q_zero;
-    m30.L = L;
-    P.ms.push_back(m30);
-        
-    PairMeasure m31;
-    m31.q1 = VectorXd(N);
-    m31.q2 = VectorXd(N);
-    m31.q1 << 1.1516, -0.2157, 0.836, 0.047, -0.8486, -0.2987, 1.2397;
-    m31.q2 << 1.5339,  0.1492,  0.9253, - 0.8119, - 0.7188, 0.0692, 0.9671;
-    m31.q1 += q_zero;
-    m31.q2 += q_zero;
-    m31.L = L;
-    P.ms.push_back(m31);
+            PairMeasure m28;
+            m28.q1 = VectorXd(N);
+            m28.q2 = VectorXd(N);
+            m28.q1 << 1.3689, 0.1763, 0.9633, -0.7468, -0.7068, -0.1617, 0.9807;
+            m28.q2 << 1.0175, -0.3322, 0.8553, 0.1168, -0.7612, -0.4188, 1.1046;
+            m28.q1 += q_zero;
+            m28.q2 += q_zero;
+            m28.L = L;
+            P.ms.push_back(m28);
 
-    PairMeasure m32;
-    m32.q1 = VectorXd(N);
-    m32.q2 = VectorXd(N);
-    m32.q1 << 1.5339, 0.1492, 0.9253, -0.8119, -0.7188, 0.0692, 0.9671;
-    m32.q2 << 1.2077,  - 0.3425, 0.7636, - 0.059, - 0.8842, - 0.2411, 1.0533;
-    m32.q1 += q_zero;
-    m32.q2 += q_zero;
-    m32.L = L;
-    P.ms.push_back(m32);
-    
-    }
-    
- 
+
+            //数据3
+            PairMeasure m29;
+            m29.q1 = VectorXd(N);
+            m29.q2 = VectorXd(N);
+            m29.q1 << 1.3009, 0.0904, 0.9975, -0.2743, -0.645, -0.3883, 1.2294;
+            m29.q2 << 1.4096, -0.1788, 0.8755, -0.4379, -0.7013, -0.2669, 0.8589;
+            m29.q1 += q_zero;
+            m29.q2 += q_zero;
+            m29.L = L;
+            P.ms.push_back(m29);
+
+            PairMeasure m30;
+            m30.q1 = VectorXd(N);
+            m30.q2 = VectorXd(N);
+            m30.q1 << 1.4096, -0.1788, 0.8755, -0.4379, -0.7013, -0.2669, 0.8589;
+            m30.q2 << 1.4905, 0.1012, 1.0764, -0.7368, -0.3712, 0.4034, 1.0246;
+            m30.q1 += q_zero;
+            m30.q2 += q_zero;
+            m30.L = L;
+            P.ms.push_back(m30);
+
+            PairMeasure m31;
+            m31.q1 = VectorXd(N);
+            m31.q2 = VectorXd(N);
+            m31.q1 << 1.1516, -0.2157, 0.836, 0.047, -0.8486, -0.2987, 1.2397;
+            m31.q2 << 1.5339, 0.1492, 0.9253, -0.8119, -0.7188, 0.0692, 0.9671;
+            m31.q1 += q_zero;
+            m31.q2 += q_zero;
+            m31.L = L;
+            P.ms.push_back(m31);
+
+            PairMeasure m32;
+            m32.q1 = VectorXd(N);
+            m32.q2 = VectorXd(N);
+            m32.q1 << 1.5339, 0.1492, 0.9253, -0.8119, -0.7188, 0.0692, 0.9671;
+            m32.q2 << 1.2077, -0.3425, 0.7636, -0.059, -0.8842, -0.2411, 1.0533;
+            m32.q1 += q_zero;
+            m32.q2 += q_zero;
+            m32.L = L;
+            P.ms.push_back(m32);
+
+        }
+
+
         //点数据测量
-VectorXd x = VectorXd(2 * N); // [a... d...] 单位与模型一致（米）
-    x << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.3257, 0.0, 0.417, 0.0, 0.417, -0.005, -0.1777;
-    // 
-//x << 0.00949634, -0.0373005, -0.0397059, 0.00226069, 0.00301545, -0.0334828, -0.0036142,
-//-0.3257, -0.00618952, 0.416707, -0.0125635, 0.377839, 0.0188565, -0.284135;//目前最优解
+        VectorXd x = VectorXd(2 * N); // [a... d...] 单位与模型一致（米）
+        //x << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.3257, 0.0, 0.417, 0.0, 0.417, -0.005, -0.1777;
+        // 
+    //x << 0.00949634, -0.0373005, -0.0397059, 0.00226069, 0.00301545, -0.0334828, -0.0036142,
+    //-0.3257, -0.00618952, 0.416707, -0.0125635, 0.377839, 0.0188565, -0.284135;//目前最优解
 
-//x << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.3257, 0.0, 0.417, 0.0, 0.417, -0.005, -0.2807;
+    //x << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.3257, 0.0, 0.417, 0.0, 0.417, -0.005, -0.2807;
 
-    //x << 0.0113313,- 0.0377749,- 0.0365,0.00157395,0.00480862,- 0.0313688,- 0.00377635,
-     //   - 0.3257,- 0.00510162,0.416142,- 0.0153563,0.380811,0.0154212,- 0.282841;//32组标定
+        x << 0.0113313, -0.0377749, -0.0365, 0.00157395, 0.00480862, -0.0313688, -0.00377635,
+            -0.3257, -0.00510162, 0.416142, -0.0153563, 0.380811, 0.0154212, -0.282841;//32组标定
 
 
-   // x << 0.0269977, -0.0293163, -0.00997228, 0.0817648, -0.148481, 0.200827, -0.617757,
-    //-0.3257, -0.0243066, 0.421254, -0.00891689, 0.565857, -0.0992149, -0.124915;//16组标定
+        // x << 0.0269977, -0.0293163, -0.00997228, 0.0817648, -0.148481, 0.200827, -0.617757,
+         //-0.3257, -0.0243066, 0.421254, -0.00891689, 0.565857, -0.0992149, -0.124915;//16组标定
 
-    //for (int i = 0; i < 2; i++) {
-    UDirs U1 = compute_u_dirs(P.alpha, P.ms[31].q1);
-        UDirs U2 = compute_u_dirs(P.alpha, P.ms[31].q2);
+         //for (int i = 0; i < 2; i++) {
+        UDirs U1 = compute_u_dirs(P.alpha, P.ms[0].q1);
+        UDirs U2 = compute_u_dirs(P.alpha, P.ms[0].q2);
 
         Vector3d p1, p2, v, vhat; double vnorm;
-            eval_v_and_dir(U1, U2, x, N, p1, p2, v, vhat, vnorm);
+        eval_v_and_dir(U1, U2, x, N, p1, p2, v, vhat, vnorm);
 
-            
-            std::cout << p1 << endl;
-            std::cout << p2 << endl;
-            std::cout << vnorm-0.25 << endl;
-    //}
-  /*
-  
-    
-    
-    
-    SolverOptions opt;
-    opt.verbose = true;   // 打印
-    auto ret = solve_ad_length(P, x0, opt);
 
-    std::cout << "converged=" << ret.converged
-        << " iters=" << ret.iters
-        << " final_cost=" << ret.final_cost << "\n";
-    std::cout << "a (m): ";
-    for (int i = 0; i < N; ++i) std::cout << ret.x[i] << " ";
-    std::cout << "\nd (m): ";
-    for (int i = 0; i < N; ++i) std::cout << ret.x[N + i] << " ";
-    std::cout << "\n";
+        std::cout << p1 << endl;
+        std::cout << p2 << endl;
+        std::cout << vnorm - 0.25 << endl;
+        //}
+      /*
+
+
+
+
+        SolverOptions opt;
+        opt.verbose = true;   // 打印
+        auto ret = solve_ad_length(P, x0, opt);
+
+        std::cout << "converged=" << ret.converged
+            << " iters=" << ret.iters
+            << " final_cost=" << ret.final_cost << "\n";
+        std::cout << "a (m): ";
+        for (int i = 0; i < N; ++i) std::cout << ret.x[i] << " ";
+        std::cout << "\nd (m): ";
+        for (int i = 0; i < N; ++i) std::cout << ret.x[N + i] << " ";
+        std::cout << "\n";
+     */
+    }
+else if(k==2){
+
+        int N = 7; // 轴数可变
+        Problem2 P;
+        P.N = N;
+        P.alpha.resize(P.N);
+        // TODO: 填入真实 alpha_i（弧度）
+        // 例如：P.alpha << 0, -M_PI/2, 0, -M_PI/2,  M_PI/2, -M_PI/2, 0;
+        P.alpha << 1.5708, 1.5708, 1.5708, 1.5708, 1.5708, 1.5708, 1.5708;
+        
+
+/*
+
+        //像下面一样自己手动输入
+        VectorXd q_zero;
+        q_zero.resize(7);
+        q_zero << -1.5708, 1.5708, 1.5708, -1.5708, -3.1416, -1.5708, 0.0;
+
+        PoseMeasure m1;
+        m1.q = VectorXd(N);
+        m1.q << 2.0413, -0.9737, 2.6135, -0.1773, -2.0266, 0.6625, -0.0355;
+        m1.q += q_zero;
+        m1.p <<0.1,0.2,0.3;
+        P.ms.push_back(m1);
+
+        VectorXd x0 = VectorXd(2 * N); // [a... d...] 单位与模型一致（米）初值
+        x0 << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //a
+            -0.3257, 0.0, 0.417, 0.0, 0.417, -0.005, -0.1777;//d
+
+
+        UDirs U1 = compute_u_dirs(P.alpha, P.ms[0].q);
+ 
+        Vector3d p1;
+        eval_p(U1,  x0, N, p1);
+
+        std::cout << p1 << endl;
  */
+
+    //像下面一样自己手动输入
+        {
+        VectorXd q_zero;
+        q_zero.resize(7);
+        q_zero << -1.5708, 1.5708, 1.5708, -1.5708, -3.1416, -1.5708, 0.0;
+
+        PoseMeasure m1;
+        m1.q = VectorXd(N);
+        m1.q << 2.0413, -0.9737, 2.6135, -0.1773, -2.0266, 0.6625, -0.0355;
+        m1.q += q_zero;
+        m1.p << 0.1, 0.2, 0.3;
+        P.ms.push_back(m1);
+        }
+
+        VectorXd x0 = VectorXd(2 * N); // [a... d...] 单位与模型一致（米）初值
+        x0 << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //a
+            -0.3257, 0.0, 0.417, 0.0, 0.417, -0.005, -0.1777;//d
+
+        SolverOptions opt;
+        auto ret = solve_ad_point(P, x0, opt);   // 函数名没变
+
+        VectorXd x_opt = ret.x;   // 标定后的 a,d
+
+        std::cout << "converged=" << ret.converged
+            << " iters=" << ret.iters
+            << " final_cost=" << ret.final_cost << "\n";
+        std::cout << "a (m): ";
+        for (int i = 0; i < N; ++i) std::cout << ret.x[i] << " ";
+        std::cout << "\nd (m): ";
+        for (int i = 0; i < N; ++i) std::cout << ret.x[N + i] << " ";
+        std::cout << "\n";
+
+    }
+
+    
     return 0;
 }
